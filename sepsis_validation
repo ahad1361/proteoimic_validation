@@ -1,0 +1,189 @@
+# Load required libraries
+library(randomForest)
+library(xgboost)
+library(e1071)   # For SVM
+library(caret)   # For confusionMatrix and easy evaluation metrics
+library(logger)  # For logging
+
+# ======================
+# Setup Logging
+# ======================
+log_appender(appender_file("validation_log_file.log"))
+log_threshold(INFO)
+log_info("Script started")
+
+# ======================
+# 1) Load Training Data
+# ======================
+train_data_path <- "mice_imputed.csv"
+mice_imputed <- read.csv(train_data_path, check.names = TRUE)
+log_info("Training data loaded from: {train_data_path}")
+
+# ======================
+# 2) Specify Features
+# ======================
+selected_feature_names <- c(
+  "apache","sofa_max","albumin", "bilirubin", "cr",
+  "TNFR1_mean","IL_6_mean", "IL_8_mean", "IL_18_mean","bun",
+  "dbp_min","CCL3_mean", "CCL7_mean", "PD_L1_mean", "CXCL9_mean",
+  "CXCL10_mean", "alc_d1"
+)
+target_variable <- "sepsis"
+
+# Convert target to factor
+mice_imputed[[target_variable]] <- factor(mice_imputed[[target_variable]], levels = c(0, 1))
+
+# ======================
+# 3) Train Models
+# ======================
+
+# ---- Random Forest ----
+set.seed(123)
+rf_model <- randomForest(
+  x = mice_imputed[, selected_feature_names],
+  y = mice_imputed[[target_variable]],
+  importance = TRUE  # to allow extraction of feature importance
+)
+
+# ---- XGBoost ----
+# XGBoost requires numeric labels
+dtrain <- xgb.DMatrix(
+  data = as.matrix(mice_imputed[, selected_feature_names]),
+  label = as.numeric(as.character(mice_imputed[[target_variable]]))
+)
+xgb_model <- xgboost(
+  data = dtrain,
+  max_depth = 6,
+  eta = 0.1,
+  nrounds = 100,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+# ---- SVM ----
+svm_model <- svm(
+  x = mice_imputed[, selected_feature_names],
+  y = mice_imputed[[target_variable]],
+  type = "C-classification",
+  probability = TRUE
+)
+
+log_info("All models trained on the full training dataset")
+
+# ======================
+# 4) Load Test Data
+# ======================
+test_data_path <- "test_data_for_validation_mean_imputed.csv"
+test_data <- read.csv(test_data_path, check.names = TRUE)
+log_info("Test data loaded from: {test_data_path}")
+
+# Ensure the target variable in the test data is also a factor with the same levels
+if (!target_variable %in% colnames(test_data)) {
+  stop("Target variable ('", target_variable, "') not found in test dataset.")
+}
+test_data[[target_variable]] <- factor(test_data[[target_variable]], levels = c(0, 1))
+
+# Check if all selected features exist in test_data
+missing_cols <- setdiff(selected_feature_names, colnames(test_data))
+if (length(missing_cols) > 0) {
+  stop("The following required columns are missing in the test dataset: ", paste(missing_cols, collapse = ", "))
+} else {
+  log_info("All selected features exist in the test dataset.")
+}
+
+# Split features and target
+X_test <- test_data[, selected_feature_names, drop = FALSE]
+y_test <- test_data[[target_variable]]
+
+# ======================
+# 5) Predict on Test Data
+# ======================
+
+# ---- Random Forest Predictions ----
+rf_pred_prob <- predict(rf_model, X_test, type = "prob")[, "1"]
+rf_pred <- ifelse(rf_pred_prob > 0.5, "1", "0")
+
+# ---- XGBoost Predictions ----
+xgb_pred_prob <- predict(xgb_model, as.matrix(X_test))
+xgb_pred <- ifelse(xgb_pred_prob > 0.5, "1", "0")
+
+# ---- SVM Predictions ----
+svm_pred_prob <- attr(predict(svm_model, X_test, probability = TRUE), "probabilities")[, "1"]
+svm_pred <- ifelse(svm_pred_prob > 0.5, "1", "0")
+
+# ======================
+# 6) Evaluate Performance
+# ======================
+get_classification_metrics <- function(predictions, true_labels) {
+  predictions <- factor(predictions, levels = c("0", "1"))
+  true_labels  <- factor(true_labels, levels = c("0", "1"))
+  
+  cm <- table(True = true_labels, Predicted = predictions)
+  accuracy <- sum(diag(cm)) / sum(cm)
+  
+  # Sensitivity (Recall) for the "1" class:
+  # Make sure to handle edge cases where denominator can be zero
+  sensitivity <- if (sum(cm["1", ]) == 0) NA else cm["1", "1"] / sum(cm["1", ])
+  
+  # Precision for the "1" class:
+  precision <- if (sum(cm[, "1"]) == 0) NA else cm["1", "1"] / sum(cm[, "1"])
+  
+  # F1 score
+  f1 <- if (!is.na(precision) && !is.na(sensitivity) && (precision + sensitivity) > 0) {
+    2 * precision * sensitivity / (precision + sensitivity)
+  } else {
+    NA
+  }
+  
+  list(
+    Accuracy = accuracy,
+    Sensitivity = sensitivity,
+    F1 = f1
+  )
+}
+
+rf_metrics <- get_classification_metrics(rf_pred, y_test)
+xgb_metrics <- get_classification_metrics(xgb_pred, y_test)
+svm_metrics <- get_classification_metrics(svm_pred, y_test)
+
+# Combine results
+results <- data.frame(
+  Model = c("Random Forest", "XGBoost", "SVM"),
+  Accuracy = c(rf_metrics$Accuracy, xgb_metrics$Accuracy, svm_metrics$Accuracy),
+  Sensitivity = c(rf_metrics$Sensitivity, xgb_metrics$Sensitivity, svm_metrics$Sensitivity),
+  F1 = c(rf_metrics$F1, xgb_metrics$F1, svm_metrics$F1)
+)
+
+# Save performance to CSV
+output_perf_path <- "sepsis_test_classification_performance.csv"
+write.csv(results, output_perf_path, row.names = FALSE)
+log_info("Test set classification results saved to: {output_perf_path}")
+
+# ======================
+# 7) Feature Importances
+# ======================
+
+# ---- Random Forest Feature Importance ----
+rf_importance <- importance(rf_model)
+# Depending on your RF version, columns might differ. 
+# Commonly, "MeanDecreaseGini" is used:
+rf_importance_df <- data.frame(
+  Feature = rownames(rf_importance),
+  MeanDecreaseGini = rf_importance[,"MeanDecreaseGini"],
+  row.names = NULL
+)
+
+rf_imp_path <- "valid_sepsis_rf_importance.csv"
+write.csv(rf_importance_df, rf_imp_path, row.names = FALSE)
+log_info("Random Forest feature importance saved to: {rf_imp_path}")
+
+# ---- XGBoost Feature Importance ----
+xgb_importance <- xgb.importance(
+  feature_names = selected_feature_names, 
+  model = xgb_model
+)
+xgb_imp_path <- "valid_sepsis_xgb_importance.csv"
+write.csv(xgb_importance, xgb_imp_path, row.names = FALSE)
+log_info("XGBoost feature importance saved to: {xgb_imp_path}")
+
+log_info("Script finished successfully.")
