@@ -1,189 +1,222 @@
-# Load required libraries
 library(randomForest)
-library(xgboost)
-library(e1071)   # For SVM
-library(caret)   # For confusionMatrix and easy evaluation metrics
-library(logger)  # For logging
+library(caret)   # for confusionMatrix (if you want more detailed metrics)
+library(logger)  # for logging
+library(pROC)
+library(ggplot2)
+
 
 # ======================
-# Setup Logging
+#  Logging
 # ======================
-log_appender(appender_file("validation_log_file.log"))
+log_dir  <- "log directory"
+if (!dir.exists(log_dir)) dir.create(log_dir, recursive = TRUE)
+log_file <- file.path(log_dir, "validation_log_file.log")
+log_appender(appender_file(log_file))
 log_threshold(INFO)
-log_info("Script started")
+
+log_info("=== SCRIPT STARTED at {format(Sys.time(), '%Y-%m-%d %H:%M:%S')} ===")
 
 # ======================
 # 1) Load Training Data
 # ======================
-train_data_path <- "mice_imputed.csv"
-mice_imputed <- read.csv(train_data_path, check.names = TRUE)
-log_info("Training data loaded from: {train_data_path}")
+train_data_path <- "train_data.csv"
+mice_imputed    <- read.csv(train_data_path, check.names = TRUE)
+log_info("Loaded training data from: {train_data_path}")
+log_info("Training data dimensions: {nrow(mice_imputed)} rows × {ncol(mice_imputed)} columns")
+
+
+if ("sepsis" %in% colnames(mice_imputed)) {
+  tab_train <- table(mice_imputed$sepsis)
+  log_info("Training class distribution (sepsis): {paste(names(tab_train), tab_train, sep='=', collapse=', ')}")
+} else {
+  log_warn("Training data has no 'sepsis' column at load time")
+}
 
 # ======================
-# 2) Specify Features
+# Load Validation  Data
+# ======================
+test_data_path <- "Gtest_data.csv"
+test_data_raw  <- read.csv(test_data_path, check.names = TRUE)
+log_info("Loaded validation data from: {test_data_path}")
+log_info("Validation data dimensions: {nrow(test_data_raw)} rows × {ncol(test_data_raw)} columns")
+
+# Log class distribution in validation set
+if ("sepsis" %in% colnames(test_data_raw)) {
+  tab_val <- table(test_data_raw$sepsis)
+  log_info("Validation class distribution (sepsis): {paste(names(tab_val), tab_val, sep='=', collapse=', ')}")
+} else {
+  log_warn("Validation data has no 'sepsis' column at load time")
+}
+
+# ======================
+#  Specify Features and Target
 # ======================
 selected_feature_names <- c(
-  "apache","sofa_max","albumin", "bilirubin", "cr",
-  "TNFR1_mean","IL_6_mean", "IL_8_mean", "IL_18_mean","bun",
-  "dbp_min","CCL3_mean", "CCL7_mean", "PD_L1_mean", "CXCL9_mean",
-  "CXCL10_mean", "alc_d1"
+  "CCL3_mean", "CXCL10_mean", "IL.10_mean", "IL.18_mean", "IL.6_mean", "IL.8_mean",
+  "PD.L1_mean", "TNFR1_mean", "age", "albumin", "alc_d1", "apache", "bilirubin",
+  "bun", "cr", "dbp_min", "gcs", "hct", "lactate", "lps_18h_il6", "lps_18h_tnf",
+  "sofa_d1", "sofa_max", "temp"
+  , "shock", "vent"
 )
 target_variable <- "sepsis"
 
-# Convert target to factor
+log_info("Selected features ({length(selected_feature_names)}): {paste(selected_feature_names, collapse=', ')}")
+log_info("Target variable: {target_variable}")
+
+
 mice_imputed[[target_variable]] <- factor(mice_imputed[[target_variable]], levels = c(0, 1))
-
-# ======================
-# 3) Train Models
-# ======================
-
-# ---- Random Forest ----
-set.seed(123)
-rf_model <- randomForest(
-  x = mice_imputed[, selected_feature_names],
-  y = mice_imputed[[target_variable]],
-  importance = TRUE  # to allow extraction of feature importance
-)
-
-# ---- XGBoost ----
-# XGBoost requires numeric labels
-dtrain <- xgb.DMatrix(
-  data = as.matrix(mice_imputed[, selected_feature_names]),
-  label = as.numeric(as.character(mice_imputed[[target_variable]]))
-)
-xgb_model <- xgboost(
-  data = dtrain,
-  max_depth = 6,
-  eta = 0.1,
-  nrounds = 100,
-  objective = "binary:logistic",
-  verbose = 0
-)
-
-# ---- SVM ----
-svm_model <- svm(
-  x = mice_imputed[, selected_feature_names],
-  y = mice_imputed[[target_variable]],
-  type = "C-classification",
-  probability = TRUE
-)
-
-log_info("All models trained on the full training dataset")
-
-# ======================
-# 4) Load Test Data
-# ======================
-test_data_path <- "test_data_for_validation_mean_imputed.csv"
-test_data <- read.csv(test_data_path, check.names = TRUE)
-log_info("Test data loaded from: {test_data_path}")
-
-# Ensure the target variable in the test data is also a factor with the same levels
-if (!target_variable %in% colnames(test_data)) {
-  stop("Target variable ('", target_variable, "') not found in test dataset.")
+if (!target_variable %in% colnames(test_data_raw)) {
+  stop("Target variable ('", target_variable, "') not found in validation dataset.")
 }
-test_data[[target_variable]] <- factor(test_data[[target_variable]], levels = c(0, 1))
+test_data_raw[[target_variable]] <- factor(test_data_raw[[target_variable]], levels = c(0, 1))
 
-# Check if all selected features exist in test_data
-missing_cols <- setdiff(selected_feature_names, colnames(test_data))
-if (length(missing_cols) > 0) {
-  stop("The following required columns are missing in the test dataset: ", paste(missing_cols, collapse = ", "))
-} else {
-  log_info("All selected features exist in the test dataset.")
+
+missing_in_train <- setdiff(selected_feature_names, colnames(mice_imputed))
+if (length(missing_in_train) > 0) {
+  stop("Missing in training data: ", paste(missing_in_train, collapse = ", "))
+}
+missing_in_test <- setdiff(selected_feature_names, colnames(test_data_raw))
+if (length(missing_in_test) > 0) {
+  stop("Missing in validation data: ", paste(missing_in_test, collapse = ", "))
+}
+log_info("All selected features present in both training and validation sets.")
+
+
+train_summary <- data.frame(
+  Feature = selected_feature_names,
+  Mean    = sapply(selected_feature_names, function(col) mean(mice_imputed[[col]], na.rm = TRUE)),
+  SD      = sapply(selected_feature_names, function(col) sd(mice_imputed[[col]], na.rm = TRUE))
+)
+log_info("Training feature summaries (first 5):")
+for (j in seq_len(min(5, nrow(train_summary)))) {
+  log_info("  {train_summary$Feature[j]}: mean={round(train_summary$Mean[j],4)}, sd={round(train_summary$SD[j],4)}")
+}
+if (nrow(train_summary) > 5) {
+  log_info("  ... {nrow(train_summary) - 5} more features logged")
 }
 
-# Split features and target
-X_test <- test_data[, selected_feature_names, drop = FALSE]
-y_test <- test_data[[target_variable]]
 
-# ======================
-# 5) Predict on Test Data
-# ======================
+val_summary <- data.frame(
+  Feature = selected_feature_names,
+  Mean    = sapply(selected_feature_names, function(col) mean(test_data_raw[[col]], na.rm = TRUE)),
+  SD      = sapply(selected_feature_names, function(col) sd(test_data_raw[[col]], na.rm = TRUE))
+)
+log_info("Validation feature summaries (first 5):")
+for (j in seq_len(min(5, nrow(val_summary)))) {
+  log_info("  {val_summary$Feature[j]}: mean={round(val_summary$Mean[j],4)}, sd={round(val_summary$SD[j],4)}")
+}
+if (nrow(val_summary) > 5) {
+  log_info("  ... {nrow(val_summary) - 5} more features logged")
+}
 
-# ---- Random Forest Predictions ----
-rf_pred_prob <- predict(rf_model, X_test, type = "prob")[, "1"]
-rf_pred <- ifelse(rf_pred_prob > 0.5, "1", "0")
 
-# ---- XGBoost Predictions ----
-xgb_pred_prob <- predict(xgb_model, as.matrix(X_test))
-xgb_pred <- ifelse(xgb_pred_prob > 0.5, "1", "0")
+X_test <- test_data_raw[, selected_feature_names, drop = FALSE]
+y_test <- test_data_raw[[target_variable]]
 
-# ---- SVM Predictions ----
-svm_pred_prob <- attr(predict(svm_model, X_test, probability = TRUE), "probabilities")[, "1"]
-svm_pred <- ifelse(svm_pred_prob > 0.5, "1", "0")
+# -------------------------------
+# 10 RF runs 
+# -------------------------------
+n_runs <- 10
+all_rf_metrics <- vector("list", n_runs)
+all_importances <- vector("list", n_runs)
 
-# ======================
-# 6) Evaluate Performance
-# ======================
-get_classification_metrics <- function(predictions, true_labels) {
-  predictions <- factor(predictions, levels = c("0", "1"))
-  true_labels  <- factor(true_labels, levels = c("0", "1"))
-  
-  cm <- table(True = true_labels, Predicted = predictions)
-  accuracy <- sum(diag(cm)) / sum(cm)
-  
-  # Sensitivity (Recall) for the "1" class:
-  # Make sure to handle edge cases where denominator can be zero
-  sensitivity <- if (sum(cm["1", ]) == 0) NA else cm["1", "1"] / sum(cm["1", ])
-  
-  # Precision for the "1" class:
-  precision <- if (sum(cm[, "1"]) == 0) NA else cm["1", "1"] / sum(cm[, "1"])
-  
-  # F1 score
-  f1 <- if (!is.na(precision) && !is.na(sensitivity) && (precision + sensitivity) > 0) {
-    2 * precision * sensitivity / (precision + sensitivity)
-  } else {
-    NA
-  }
-  
-  list(
-    Accuracy = accuracy,
-    Sensitivity = sensitivity,
-    F1 = f1
+for (i in seq_len(n_runs)) {
+
+  this_seed <- 123 + i
+  set.seed(this_seed)
+  log_info("Run {i} | seed = {this_seed}")
+
+ 
+  train_prev <- mean(mice_imputed[[target_variable]] == 1)
+  class_wt   <- c("0" = 1 / (1 - train_prev),
+                  "1" = 1 / train_prev)
+
+ 
+  rf_model_i <- randomForest(
+    x          = mice_imputed[, selected_feature_names],
+    y          = mice_imputed[[target_variable]],
+    ntree      = 1000,
+    mtry       = floor(sqrt(length(selected_feature_names))),
+    importance = TRUE,
+    classwt    = class_wt
+  )
+  log_info("Run {i} | RF trained (ntree={rf_model_i$ntree}, mtry={rf_model_i$mtry})")
+
+
+  oob_prob   <- rf_model_i$votes[, "1"]              # OOB class-1 prob
+  oob_truth  <- mice_imputed[[target_variable]]
+  roc_train  <- pROC::roc(oob_truth, oob_prob, quiet = TRUE)
+  opt_cut    <- pROC::coords(roc_train, "best", best.method = "youden",
+                             transpose = FALSE)$threshold
+  log_info("Run {i} | Youden-J cut-off (OOB) = {round(opt_cut, 3)}")
+
+  ## 4·4  ONE-SHOT prediction on validation (“exam”) set
+  rf_prob_val <- predict(rf_model_i, X_test, type = "prob")[, "1"]
+  rf_pred_val <- ifelse(rf_prob_val >= opt_cut, "1", "0")
+
+ 
+  cm          <- table(True = y_test, Pred = rf_pred_val)
+  acc         <- sum(diag(cm)) / sum(cm)
+  sens        <- if (sum(cm["1", ]) == 0) NA else cm["1", "1"] / sum(cm["1", ])
+  spec        <- if (sum(cm["0", ]) == 0) NA else cm["0", "0"] / sum(cm["0", ])
+  prec        <- if (sum(cm[, "1"]) == 0) NA else cm["1", "1"] / sum(cm[, "1"])
+  f1          <- if (!is.na(prec) && !is.na(sens) && prec + sens > 0)
+                   2 * prec * sens / (prec + sens) else NA
+  auc_val     <- as.numeric(pROC::auc(y_test, rf_prob_val))
+
+  all_rf_metrics[[i]] <- data.frame(
+    Run = i, Accuracy = acc, Sensitivity = sens,
+    Specificity = spec, Precision = prec, F1 = f1, AUC = auc_val
+  )
+
+  log_info(
+    "Run {i} | Val: Acc={round(acc,3)}  Sens={round(sens,3)}  ",
+    "Spec={round(spec,3)}  F1={round(f1,3)}  AUC={round(auc_val,3)}"
+  )
+
+
+  write.csv(
+    data.frame(
+      PatientID   = if ("patient_id" %in% names(test_data_raw))
+                      test_data_raw$patient_id
+                    else seq_len(nrow(test_data_raw)),
+      Actual      = y_test,
+      Predicted   = rf_pred_val,
+      Prob_Sepsis = rf_prob_val
+    ),
+    file = sprintf("predictions_run%02d.csv", i),
+    row.names = FALSE
+  )
+
+
+  all_importances[[i]] <- data.frame(
+    Feature          = rownames(rf_model_i$importance),
+    MeanDecreaseGini = rf_model_i$importance[, "MeanDecreaseGini"],
+    stringsAsFactors = FALSE
   )
 }
 
-rf_metrics <- get_classification_metrics(rf_pred, y_test)
-xgb_metrics <- get_classification_metrics(xgb_pred, y_test)
-svm_metrics <- get_classification_metrics(svm_pred, y_test)
 
-# Combine results
-results <- data.frame(
-  Model = c("Random Forest", "XGBoost", "SVM"),
-  Accuracy = c(rf_metrics$Accuracy, xgb_metrics$Accuracy, svm_metrics$Accuracy),
-  Sensitivity = c(rf_metrics$Sensitivity, xgb_metrics$Sensitivity, svm_metrics$Sensitivity),
-  F1 = c(rf_metrics$F1, xgb_metrics$F1, svm_metrics$F1)
-)
 
-# Save performance to CSV
-output_perf_path <- "sepsis_test_classification_performance.csv"
-write.csv(results, output_perf_path, row.names = FALSE)
-log_info("Test set classification results saved to: {output_perf_path}")
+rf_summary <- do.call(rbind, all_rf_metrics)
 
-# ======================
-# 7) Feature Importances
-# ======================
 
-# ---- Random Forest Feature Importance ----
-rf_importance <- importance(rf_model)
-# Depending on your RF version, columns might differ. 
-# Commonly, "MeanDecreaseGini" is used:
-rf_importance_df <- data.frame(
-  Feature = rownames(rf_importance),
-  MeanDecreaseGini = rf_importance[,"MeanDecreaseGini"],
-  row.names = NULL
-)
+rf_mean <- as.data.frame(t(colMeans(rf_summary, na.rm = TRUE)))
+rf_sd   <- as.data.frame(t(apply(rf_summary, 2, sd, na.rm = TRUE)))
 
-rf_imp_path <- "valid_sepsis_rf_importance.csv"
-write.csv(rf_importance_df, rf_imp_path, row.names = FALSE)
-log_info("Random Forest feature importance saved to: {rf_imp_path}")
 
-# ---- XGBoost Feature Importance ----
-xgb_importance <- xgb.importance(
-  feature_names = selected_feature_names, 
-  model = xgb_model
-)
-xgb_imp_path <- "valid_sepsis_xgb_importance.csv"
-write.csv(xgb_importance, xgb_imp_path, row.names = FALSE)
-log_info("XGBoost feature importance saved to: {xgb_imp_path}")
+rf_stats <- rbind(mean = rf_mean, sd = rf_sd)
+rf_stats <- cbind(stat = rownames(rf_stats), rf_stats)
+rownames(rf_stats) <- NULL
 
-log_info("Script finished successfully.")
+
+write.csv(rf_summary,
+          file = file.path(log_dir, "rf_validation_summary.csv"),
+          row.names = FALSE)
+
+
+write.csv(rf_stats,
+          file = file.path(log_dir, "rf_validation_summary_stats.csv"),
+          row.names = FALSE)
+
+log_info("=== SCRIPT FINISHED at {format(Sys.time(), '%Y-%m-%d %H:%M:%S')} ===")
