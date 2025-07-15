@@ -1,0 +1,219 @@
+
+
+library(randomForest)  # for Random Forest
+library(pROC)          # for ROC curves
+
+base_dir <- "enter your base drive"
+
+
+n_repeats <- 10
+
+clinical_vars <- c(
+  "CCL3_mean",
+  "CXCL10_mean",
+  "IL.10_mean",
+  "IL.18_mean",
+  "IL.6_mean",
+  "IL.8_mean",
+  "PD.L1_mean",
+  "TNFR1_mean",
+  "age",
+  "albumin",
+  "alc_d1",
+  "apache",
+  "bilirubin",
+  "bun",
+  "cr",
+  "dbp_min",
+  "gcs",
+  "hct",
+  "lactate",
+  "lps_18h_il6",
+  "lps_18h_tnf",
+  "sofa_d1",
+  "sofa_max",
+  "temp",
+  "shock",    
+  "vent"      
+)
+
+# Single binary target
+target <- "sepsis"
+
+# ----------------------------------------
+# HELPER: MANUAL AUC CALCULATION (Mann–Whitney U)
+# ----------------------------------------
+compute_auc <- function(y_true_factor, y_prob, positive_level) {
+  # Convert factor to 0/1
+  y_true_bin <- ifelse(y_true_factor == positive_level, 1, 0)
+  pos_idx <- which(y_true_bin == 1)
+  neg_idx <- which(y_true_bin == 0)
+  n_pos <- length(pos_idx)
+  n_neg <- length(neg_idx)
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+  ranks <- rank(y_prob)
+  sum_pos_ranks <- sum(ranks[pos_idx])
+  auc <- (sum_pos_ranks - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  return(auc)
+}
+
+# ----------------------------------------
+# MAIN SCRIPT
+# ----------------------------------------
+# 1) Load data
+df <- read.csv(paste0(base_dir, "data.csv"), check.names = TRUE)
+
+# 2) Ensure the target exists and is a factor
+if (!(target %in% names(df))) {
+  stop("ERROR: Column '", target, "' not found in the data frame.")
+}
+if (!is.factor(df[[target]])) {
+  df[[target]] <- as.factor(df[[target]])
+}
+
+n_samples <- nrow(df)
+
+# 3) Prepare storage for per‐repeat metrics
+results_by_repeat <- data.frame(
+  Repeat   = integer(),
+  Accuracy = numeric(),
+  F1       = numeric(),
+  AUC      = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+fpr_grid <- seq(0, 1, length.out = 100)
+tpr_matrix <- matrix(NA_real_, nrow = length(fpr_grid), ncol = n_repeats)
+
+
+positive_class <- levels(df[[target]])[2]
+
+
+for (rep_idx in seq_len(n_repeats)) {
+  # Containers for LOOCV predictions in this repeat
+  all_true <- df[[target]]
+  all_pred <- factor(rep(NA, n_samples), levels = levels(df[[target]]))
+  all_prob <- numeric(n_samples)
+  
+  # LOOCV: leave one sample out at a time
+  for (i in seq_len(n_samples)) {
+    # Set a unique seed for (repeat, fold)
+    fold_seed <- 10000 * rep_idx + i
+    set.seed(fold_seed)
+    
+    # Split train vs. validation index
+    train_idx <- setdiff(seq_len(n_samples), i)
+    X_train   <- df[train_idx, clinical_vars, drop = FALSE]
+    y_train   <- df[[target]][train_idx]
+    
+    X_valid   <- df[i, clinical_vars, drop = FALSE]
+    
+
+    rf_model <- randomForest(x = X_train, y = y_train, ntree = 500)
+    
+    # Predict label and positive‐class probability on held‐out sample
+    pred_label <- predict(rf_model, X_valid, type = "response")
+    pred_prob  <- predict(rf_model, X_valid, type = "prob")[, positive_class]
+    
+    all_pred[i] <- pred_label
+    all_prob[i] <- pred_prob
+  }
+  
+  # Compute Accuracy
+  accuracy <- mean(all_true == all_pred)
+  
+  # Compute binary F1
+  tp <- sum(all_pred == positive_class & all_true == positive_class)
+  fp <- sum(all_pred == positive_class & all_true != positive_class)
+  fn <- sum(all_pred != positive_class & all_true == positive_class)
+  precision <- if ((tp + fp) == 0) 0 else tp / (tp + fp)
+  recall    <- if ((tp + fn) == 0) 0 else tp / (tp + fn)
+  f1        <- if ((precision + recall) == 0) 0 else 2 * precision * recall / (precision + recall)
+  
+
+  auc_val <- compute_auc(all_true, all_prob, positive_class)
+  
+  # Store metrics for this repeat
+  results_by_repeat <- rbind(
+    results_by_repeat,
+    data.frame(
+      Repeat   = rep_idx,
+      Accuracy = accuracy,
+      F1       = f1,
+      AUC      = auc_val,
+      stringsAsFactors = FALSE
+    )
+  )
+  
+
+  roc_obj <- roc(response   = all_true,
+                 predictor  = all_prob,
+                 levels     = levels(all_true),
+                 direction  = "<")
+  
+  fpr <- 1 - roc_obj$specificities
+  tpr <- roc_obj$sensitivities
+  
+  interp_tpr <- approx(x = fpr, y = tpr, xout = fpr_grid, ties = mean)$y
+  tpr_matrix[, rep_idx] <- interp_tpr
+}
+
+# ----------------------------------------
+# SUMMARY: MEAN ± SD ACROSS REPEATS
+# ----------------------------------------
+accuracy_mean <- mean(results_by_repeat$Accuracy)
+accuracy_sd   <- sd(results_by_repeat$Accuracy)
+
+f1_mean <- mean(results_by_repeat$F1)
+f1_sd   <- sd(results_by_repeat$F1)
+
+auc_mean <- mean(results_by_repeat$AUC, na.rm = TRUE)
+auc_sd   <- sd(results_by_repeat$AUC, na.rm = TRUE)
+
+summary_df <- data.frame(
+  Metric        = c("Accuracy", "F1", "AUC"),
+  Mean          = c(accuracy_mean, f1_mean, auc_mean),
+  SD            = c(accuracy_sd,   f1_sd,   auc_sd),
+  stringsAsFactors = FALSE
+)
+
+# ----------------------------------------
+# SAVE RESULTS
+# ----------------------------------------
+
+write.csv(
+  results_by_repeat,
+  file = paste0(base_dir, "sepsis_RF_all_repeats.csv"),
+  row.names = FALSE
+)
+
+# Summary mean ± SD
+write.csv(
+  summary_df,
+  file = paste0(base_dir, "sepsis_RF_summary_metrics.csv"),
+  row.names = FALSE
+)
+
+# ----------------------------------------
+# PLOT AVERAGE ROC CURVE
+# ----------------------------------------
+mean_tpr <- rowMeans(tpr_matrix, na.rm = TRUE)
+
+png(
+  filename = paste0(base_dir, "rf_roc_curve_avg.png"),
+  width = 800,
+  height = 600
+)
+plot(
+  fpr_grid, mean_tpr,
+  type = "l",
+  col  = "blue",
+  lwd  = 2,
+  xlab = "False Positive Rate",
+  ylab = "True Positive Rate",
+  main = "Average ROC Curve – Random Forest"
+)
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)  # 50/50 diagonal
+dev.off()
+
