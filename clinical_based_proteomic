@@ -1,0 +1,390 @@
+```{r}
+library(randomForest)
+library(caret)
+library(pROC)
+library(logger)
+library(dplyr) 
+```
+
+
+
+Continuous variables
+
+```{r}
+
+# ----------------------------------------
+# SET UP LOGGING
+# ----------------------------------------
+log_appender(appender_file("LOOCV_RF_regression.log"))
+log_threshold(INFO)
+log_info("Regression LOOCV script (with repeats) started")
+
+# ----------------------------------------
+# LOAD DATA
+# ----------------------------------------
+data_path <- "mice_imputed.csv"
+mice_imputed <- read.csv(data_path, check.names = TRUE)
+log_info("Data loaded from: {data_path} (n = {nrow(mice_imputed)})")
+
+# ----------------------------------------
+# FIXED SETTINGS
+# ----------------------------------------
+set.seed(123)   
+n_repeats <- 10 
+
+selected_feature_names <- c(
+  "P0DJI9", "P0DJI8", "P36222", "P80188", "O43286", 
+  "P02741", "Q8N6C8", "P35443", "P24592", "P61769", 
+  "P04275", "P18428"
+)
+
+# ----------------------------------------
+# REGRESSION TARGETS
+# ----------------------------------------
+target_variables <- c(
+  "age", "bmi", "smi", "apache", "cci", "lactate", "leuk_count_d1", "alc_d1",
+  "amc_d1", "sofa_d1", "sofa_max", "CCL3_mean", "CCL7_mean", "IL.10_mean",
+  "PD.L1_mean", "CXCL9_mean", "CXCL10_mean", "FasL_mean", "TRAIL_mean",
+  "IL.8_mean", "IL.18_mean", "Leptin_mean", "TNFR1_mean", "IFNg_mean",
+  "IL.6_mean", "TNF_mean", "spo2", "temp", "sbp_min", "dbp_min", "map_min",
+  "rr_max", "gcs", "lps_18h_il6", "lps_18h_tnf", "cd3_18h_ifng",
+  "pma_18h_ifng", "bicarb", "ast", "bun", "albumin", "bilirubin", "cr",
+  "hct", "plt", "pf_ratio"
+)
+
+# ----------------------------------------
+# HELPER: COMPUTE REGRESSION METRICS
+# ----------------------------------------
+get_regression_metrics <- function(predictions, y_true) {
+  mae  <- mean(abs(predictions - y_true))
+  mse  <- mean((predictions - y_true)^2)
+  rmse <- sqrt(mse)
+  
+  ss_res <- sum((y_true - predictions)^2)
+  ss_tot <- sum((y_true - mean(y_true))^2)
+  r2     <- if (ss_tot == 0) NA_real_ else 1 - (ss_res / ss_tot)
+  
+  list(MAE = mae, MSE = mse, RMSE = rmse, R2 = r2)
+}
+
+# ----------------------------------------
+# DATAFRAME TO STORE ALL REPEATS
+# ----------------------------------------
+all_repeats_results <- data.frame(
+  Repeat = integer(),
+  Target = character(),
+  MAE    = double(),
+  MSE    = double(),
+  RMSE   = double(),
+  R2     = double(),
+  stringsAsFactors = FALSE
+)
+
+# ----------------------------------------
+# OUTER LOOP: REPEAT LOOCV n_repeats TIMES
+# ----------------------------------------
+for (rep_idx in seq_len(n_repeats)) {
+  log_info("Starting repeat {rep_idx} of {n_repeats}")
+  
+  # For reproducibility, set a new seed for this repeat
+  set.seed(1000 + rep_idx)
+  
+  # ----------------------------------------
+  # LOOP OVER EACH TARGET VARIABLE
+  # ----------------------------------------
+  for (target in target_variables) {
+    log_info("  [Repeat {rep_idx}] Processing target: {target}")
+    
+    # Extract the response
+    y_raw <- mice_imputed[[target]]
+    if (!is.numeric(y_raw)) {
+      log_warn("    Skipping {target}: not numeric")
+      next
+    }
+    y <- y_raw
+    
+   
+    X_selected <- mice_imputed[, selected_feature_names]
+    n_samples  <- nrow(X_selected)
+    
+  
+    all_rf_preds <- numeric(n_samples)
+    all_y        <- numeric(n_samples)
+    
+    # ----------------------------------------
+    # INNER LOOP: LOOCV
+    # ----------------------------------------
+    for (i in seq_len(n_samples)) {
+     
+      fold_seed <- 20000 * rep_idx + i
+      set.seed(fold_seed)
+      
+      # Split data
+      X_train <- X_selected[-i, , drop = FALSE]
+      y_train <- y[-i]
+      X_valid <- X_selected[i, , drop = FALSE]
+      y_valid <- y[i]
+      
+    
+      rf_model <- randomForest(x = X_train, y = y_train, ntree = 500)
+      
+      
+      pred_val <- predict(rf_model, X_valid)
+      all_rf_preds[i] <- pred_val
+      all_y[i]        <- y_valid
+    }
+    
+    # ----------------------------------------
+    # COMPUTE METRICS ON LOOCV PREDICTIONS
+    # ----------------------------------------
+    reg_metrics <- get_regression_metrics(all_rf_preds, all_y)
+    
+    # Log the metrics for this target & repeat
+    log_info(
+      paste0(
+        "    [Rep {rep_idx}] {target} → ",
+        "MAE={round(reg_metrics$MAE,4)}, ",
+        "MSE={round(reg_metrics$MSE,4)}, ",
+        "RMSE={round(reg_metrics$RMSE,4)}, ",
+        "R2={round(reg_metrics$R2,4)}"
+      )
+    )
+    
+    # Append to the master data.frame
+    all_repeats_results <- rbind(
+      all_repeats_results,
+      data.frame(
+        Repeat = rep_idx,
+        Target = target,
+        MAE    = reg_metrics$MAE,
+        MSE    = reg_metrics$MSE,
+        RMSE   = reg_metrics$RMSE,
+        R2     = reg_metrics$R2,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+# ----------------------------------------
+# SUMMARY: MEAN ± SD ACROSS REPEATS FOR EVERY TARGET
+# ----------------------------------------
+summary_results <- all_repeats_results %>%
+  group_by(Target) %>%
+  summarize(
+    MAE_mean  = mean(MAE),
+    MAE_sd    = sd(MAE),
+    MSE_mean  = mean(MSE),
+    MSE_sd    = sd(MSE),
+    RMSE_mean = mean(RMSE),
+    RMSE_sd   = sd(RMSE),
+    R2_mean   = mean(R2, na.rm = TRUE),
+    R2_sd     = sd(R2, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+# ----------------------------------------
+# SAVE DETAILED AND SUMMARY CSV
+# ----------------------------------------
+detailed_path <- "LOOCV_RF_regression_all_repeats.csv"
+summary_path  <- "LOOCV_RF_regression_summary.csv"
+
+write.csv(all_repeats_results, detailed_path, row.names = FALSE)
+write.csv(summary_results,  summary_path,  row.names = FALSE)
+
+log_info("All‐repeats results saved to: {detailed_path}")
+log_info("Summary (mean±SD) saved to: {summary_path}")
+log_info("Script finished")
+
+```
+
+
+
+Binary clinical variables
+
+```{r}
+
+
+
+# -------------------------------
+# SET UP LOGGING
+# -------------------------------
+log_appender(appender_file("proteomic_binary_clinical.log"))
+log_threshold(INFO)
+log_info("Script started")
+
+# -------------------------------
+# SELECTED FEATURES AND DATA
+# -------------------------------
+selected_feature_names <- c(
+  "P0DJI9", "P0DJI8", "P36222", "P80188", "O43286",
+  "P02741", "Q8N6C8", "P35443", "P24592", "P61769",
+  "P04275", "P18428"
+)
+
+data_path <- "data.csv"
+data_ <- read.csv(data_path, check.names = TRUE)
+log_info("Data loaded from: {data_path}")
+
+# -------------------------------
+# DEFINE TARGETS
+# -------------------------------
+target_variables <- c("vent", "shock", "sex")
+
+# -------------------------------
+# OUTER REPEAT LOOP
+# -------------------------------
+n_repeats <- 10
+
+
+all_repeats_results <- data.frame(
+  Repeat   = integer(),
+  Target   = character(),
+  Accuracy = numeric(),
+  F1       = numeric(),
+  AUC      = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (rep_idx in seq_len(n_repeats)) {
+  # Set a distinct seed for each repeat
+  set.seed(123 + rep_idx)
+  log_info("Starting repeat {rep_idx} of {n_repeats}")
+  
+  # In each repeat, we'll compute LOOCV for each target
+  for (target in target_variables) {
+    log_info("  [Repeat {rep_idx}] Analyzing target: {target}")
+    
+    # Extract and coerce to factor
+    y_raw <- data_[[target]]
+    y <- as.factor(y_raw)
+    if (!is.factor(y)) {
+      log_warn("  [Repeat {rep_idx}] Skipping {target}: not a factor.")
+      next
+    }
+    
+    X_selected <- data_[, selected_feature_names]
+    n_samples  <- nrow(X_selected)
+    
+    # Prepare placeholders for LOOCV predictions
+    all_rf_preds <- character(n_samples)
+    all_probs    <- numeric(n_samples)
+    
+    # Determine if binary classification
+    n_levels  <- length(levels(y))
+    is_binary <- (n_levels == 2)
+    if (is_binary) {
+      positive_class <- levels(y)[2]
+    }
+    
+    # -------------------------------
+    # LOOCV (with per‐fold seeding)
+    # -------------------------------
+    for (i in seq_len(n_samples)) {
+    
+      fold_seed <- 10000 * rep_idx + i
+      set.seed(fold_seed)
+      
+      X_train <- X_selected[-i, , drop = FALSE]
+      y_train <- y[-i]
+      X_valid <- X_selected[i, , drop = FALSE]
+      
+      rf_model <- randomForest(x = X_train, y = y_train, ntree = 500)
+      pred_class <- predict(rf_model, X_valid, type = "response")
+      all_rf_preds[i] <- as.character(pred_class)
+      
+      if (is_binary) {
+        prob_matrix    <- predict(rf_model, X_valid, type = "prob")
+        all_probs[i]   <- prob_matrix[, positive_class]
+      } else {
+        all_probs[i] <- NA_real_
+      }
+    }
+    
+    # -------------------------------
+    # COMPUTE METRICS
+    # -------------------------------
+    preds_factor <- factor(all_rf_preds, levels = levels(y))
+    
+    if (is_binary) {
+      cm     <- confusionMatrix(preds_factor, y, positive = positive_class)
+      acc_val <- cm$overall["Accuracy"]
+      f1_val  <- cm$byClass["F1"]
+    } else {
+      cm      <- confusionMatrix(preds_factor, y)
+      acc_val <- cm$overall["Accuracy"]
+      byc_mat <- cm$byClass
+      if (is.matrix(byc_mat)) {
+        f1_per_class <- byc_mat[, "F1"]
+        f1_val <- mean(f1_per_class, na.rm = TRUE)
+      } else {
+        f1_val <- byc_mat["F1"]
+      }
+    }
+    
+    if (is_binary) {
+      roc_obj <- try(
+        roc(response = y, predictor = all_probs,
+            levels = levels(y), direction = "<"),
+        silent = TRUE
+      )
+      if (inherits(roc_obj, "try-error")) {
+        log_warn("  [Repeat {rep_idx}] Failed to compute AUC for {target}; setting AUC=NA")
+        auc_val <- NA_real_
+      } else {
+        auc_val <- as.numeric(auc(roc_obj))
+      }
+    } else {
+      auc_val <- NA_real_
+    }
+    
+    log_info(
+      "  [Repeat {rep_idx}] {target} → Accuracy={round(acc_val,4)}, F1={round(f1_val,4)}, AUC={ifelse(is.na(auc_val), 'NA', round(auc_val,4))}"
+    )
+    
+    # Append to master data frame
+    all_repeats_results <- rbind(
+      all_repeats_results,
+      data.frame(
+        Repeat   = rep_idx,
+        Target   = target,
+        Accuracy = as.numeric(acc_val),
+        F1       = as.numeric(f1_val),
+        AUC      = as.numeric(auc_val),
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+# -------------------------------
+# SUMMARIZE ACROSS REPEATS
+# -------------------------------
+library(dplyr)
+
+summary_results <- all_repeats_results %>%
+  group_by(Target) %>%
+  summarize(
+    Accuracy_mean = mean(Accuracy),
+    Accuracy_sd   = sd(Accuracy),
+    F1_mean       = mean(F1),
+    F1_sd         = sd(F1),
+    AUC_mean      = mean(AUC, na.rm = TRUE),
+    AUC_sd        = sd(AUC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# -------------------------------
+# SAVE BOTH DETAILED AND SUMMARY CSVs
+# -------------------------------
+detailed_path <- "LOOCV_RF_all_repeats.csv"
+summary_path  <- "LOOCV_RF_summary_results.csv"
+
+write.csv(all_repeats_results, detailed_path, row.names = FALSE)
+write.csv(summary_results, summary_path, row.names = FALSE)
+
+log_info("All‐repeats results saved to: {detailed_path}")
+log_info("Summary results saved to: {summary_path}")
+log_info("Script finished")
+```
+
