@@ -19,6 +19,6 @@ The analysis pipeline consists of three main stages, primarily utilizing **Rando
 *   **Method:** Repeated LOOCV (10 repeats) to estimate performance metrics (AUC, Accuracy, F1).
 
 ### Stage 3: Validation in Independent Cohort
-*   **Goal:** To validate the final model's performance on an independent patient group (**Validation Cohort**, `n=60`).
+*   **Goal:** To validate the final model's performance on an independent patient group (**Validation Cohort**, `n=59`).
 *   **Model Training:** The final Random Forest model is trained on the entire Discovery Cohort.
 *   **Validation:** The model is tested on the Validation Cohort, and the process (training and testing) is repeated **10 times** to assess the stability of the prediction metrics (AUC, Sensitivity, Specificity) and feature importance.
